@@ -1,3 +1,3 @@
 https://github.com/smanni/stm32
 
-2 txt files
+3 txt references. Check 3rd file first.
