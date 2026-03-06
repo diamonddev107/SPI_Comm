@@ -1,0 +1,620 @@
+B. Linux Version (For NanoPi M4/Raspberry Pi)
+
+#!/usr/bin/env python3
+"""
+Dynamic SPI Role Detection for Linux
+Works on NanoPi M4, Raspberry Pi, etc.
+"""
+
+import spidev
+import RPi.GPIO as GPIO
+import time
+import threading
+import sys
+import argparse
+import signal
+from enum import Enum
+
+class SPIRole(Enum):
+    MASTER = "master"
+    SLAVE = "slave"
+    AUTO = "auto"
+
+class DynamicSPI:
+    def __init__(self, bus=0, device=0, role=SPIRole.AUTO):
+        self.bus = bus
+        self.device = device
+        self.role = role
+        self.spi = spidev.SpiDev()
+        self.running = True
+        self.role_pin = 17  # GPIO17 for role detection
+        self.cs_pin = 27    # GPIO27 for software CS (if needed)
+        
+        # Setup GPIO
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setwarnings(False)
+        
+    def detect_role(self):
+        """Auto-detect role based on hardware or negotiation"""
+        
+        # Method 1: Hardware pin detection
+        GPIO.setup(self.role_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+        time.sleep(0.1)
+        
+        if GPIO.input(self.role_pin) == GPIO.LOW:
+            print("Hardware detection: MASTER (role pin grounded)")
+            return SPIRole.MASTER
+        else:
+            print("Hardware detection: SLAVE (role pin floating)")
+            return SPIRole.SLAVE
+        
+        """ Method 2: Software negotiation
+        try:
+            # Try to initiate communication as master
+            self.init_as_master()
+            test_data = [0xAA, 0x55, 0xAA]
+            response = self.spi.xfer(test_data)
+            
+            if response == [0xAA, 0x55, 0xAA]:
+                print("Negotiation: MASTER (got expected response)")
+                return SPIRole.MASTER
+        except:
+            print("Negotiation: SLAVE (no response as master)")
+            return SPIRole.SLAVE
+        """
+    
+    def init_as_master(self):
+        """Initialize SPI as master"""
+        self.spi.open(self.bus, self.device)
+        self.spi.mode = 0
+        self.spi.bits_per_word = 8
+        self.spi.max_speed_hz = 1000000
+        self.spi.lsbfirst = False
+        
+        # Setup CS pin as output
+        GPIO.setup(self.cs_pin, GPIO.OUT)
+        GPIO.output(self.cs_pin, GPIO.HIGH)
+        
+        print(f"SPI initialized as MASTER on bus {self.bus}, device {self.device}")
+        
+    def init_as_slave(self):
+        """Initialize as slave (requires kernel support)"""
+        # Note: Standard spidev may not support slave mode
+        # This is a simplified version using GPIO bitbang for slave mode
+        
+        print(f"SPI initialized as SLAVE (using GPIO bitbang mode)")
+        
+        # Setup GPIO pins for bitbang slave mode
+        GPIO.setup(9, GPIO.IN)   # MISO - input (we receive)
+        GPIO.setup(10, GPIO.OUT)  # MOSI - output (we send as slave)
+        GPIO.setup(11, GPIO.IN)   # SCLK - input from master
+        GPIO.setup(8, GPIO.IN)    # CS - input from master
+        
+        # Initialize slave data
+        self.slave_data = bytearray(256)
+        self.data_ready = threading.Event()
+        
+    def master_write(self, data):
+        """Master: Write data to slave"""
+        if self.role != SPIRole.MASTER:
+            raise Exception("Not in master mode")
+        
+        GPIO.output(self.cs_pin, GPIO.LOW)
+        time.sleep(0.0001)  # Small delay
+        
+        # Convert data to list of ints
+        if isinstance(data, str):
+            data = data.encode()
+        data_list = list(data)
+        
+        # Send data and receive response
+        response = self.spi.xfer(data_list)
+        
+        GPIO.output(self.cs_pin, GPIO.HIGH)
+        
+        return bytes(response)
+    
+    def master_read(self, length):
+        """Master: Read data from slave"""
+        if self.role != SPIRole.MASTER:
+            raise Exception("Not in master mode")
+        
+        # Send dummy bytes to generate clock
+        dummy = [0x00] * length
+        data = self.spi.xfer(dummy)
+        return bytes(data)
+    
+    def slave_listen(self, callback=None):
+        """Slave: Listen for master communication"""
+        if self.role != SPIRole.SLAVE:
+            raise Exception("Not in slave mode")
+        
+        print("Slave listening for SPI communication...")
+        
+        # This is a simplified bitbang slave implementation
+        # In real applications, you'd use interrupts or dedicated hardware
+        
+        last_cs = GPIO.input(8)
+        
+        while self.running:
+            current_cs = GPIO.input(8)
+            
+            # Detect CS falling edge (master starts communication)
+            if last_cs == GPIO.HIGH and current_cs == GPIO.LOW:
+                print("CS asserted - communication starting")
+                
+                # Read data (simplified - would need to clock data in real implementation)
+                received_data = self.bitbang_receive()
+                
+                if callback:
+                    callback(received_data)
+                
+                # Prepare and send response
+                response = self.prepare_response(received_data)
+                self.bitbang_send(response)
+            
+            last_cs = current_cs
+            time.sleep(0.001)  # 1ms polling interval
+    
+    def bitbang_receive(self):
+        """Bitbang receive data as slave"""
+        # Simplified - real implementation would clock data in
+        return b"Sample received data"
+    
+    def bitbang_send(self, data):
+        """Bitbang send data as slave"""
+        # Simplified - real implementation would clock data out
+        pass
+    
+    def prepare_response(self, received_data):
+        """Prepare response based on received command"""
+        try:
+            cmd = received_data.decode().strip('\x00')
+            
+            if cmd.startswith("READ"):
+                return b"Sensor:temp=25.5C,hum=60%"
+            elif cmd.startswith("STATUS"):
+                return b"STATUS:OK,uptime=3600"
+            else:
+                return f"ACK:{cmd}".encode()
+        except:
+            return b"ERROR:Invalid command"
+    
+    def start(self):
+        """Start SPI communication based on detected role"""
+        
+        # Detect role if AUTO
+        if self.role == SPIRole.AUTO:
+            self.role = self.detect_role()
+        
+        # Initialize based on role
+        if self.role == SPIRole.MASTER:
+            self.init_as_master()
+            self.run_as_master()
+        else:
+            self.init_as_slave()
+            self.run_as_slave()
+    
+    def run_as_master(self):
+        """Run in master mode"""
+        print("Running as MASTER - initiating communications")
+        
+        try:
+            while self.running:
+                # Send command to slave
+                cmd = "READ_SENSOR"
+                print(f"Master sending: {cmd}")
+                
+                response = self.master_write(cmd)
+                print(f"Master received: {response}")
+                
+                # Read additional data
+                data = self.master_read(32)
+                print(f"Master read: {data}")
+                
+                time.sleep(2)
+                
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.cleanup()
+    
+    def run_as_slave(self):
+        """Run in slave mode"""
+        print("Running as SLAVE - waiting for master")
+        
+        def data_handler(data):
+            print(f"Slave received: {data}")
+        
+        try:
+            self.slave_listen(callback=data_handler)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Clean up resources"""
+        self.running = False
+        self.spi.close()
+        GPIO.cleanup()
+        print("SPI communication stopped")
+
+def main():
+    parser = argparse.ArgumentParser(description='Dynamic SPI Role Detection')
+    parser.add_argument('--role', choices=['master', 'slave', 'auto'], 
+                       default='auto', help='SPI role (default: auto)')
+    parser.add_argument('--bus', type=int, default=0, help='SPI bus number')
+    parser.add_argument('--device', type=int, default=0, help='SPI device number')
+    
+    args = parser.parse_args()
+    
+    # Convert string role to enum
+    role_map = {
+        'master': SPIRole.MASTER,
+        'slave': SPIRole.SLAVE,
+        'auto': SPIRole.AUTO
+    }
+    
+    # Create and start SPI
+    spi = DynamicSPI(bus=args.bus, device=args.device, role=role_map[args.role])
+    
+    def signal_handler(sig, frame):
+        print("\nStopping...")
+        spi.running = False
+        spi.cleanup()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    spi.start()
+
+if __name__ == "__main__":
+    main()
+
+
+C Version for Linux (using spidev with role detection)
+/* dynamic_spi_linux.c - Linux version with role detection */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/types.h>
+#include <linux/spi/spidev.h>
+#include <gpiod.h>  // Requires libgpiod for GPIO control
+#include <pthread.h>
+#include <signal.h>
+
+#define SPI_DEVICE "/dev/spidev0.0"
+#define ROLE_GPIO_CHIP "gpiochip0"
+#define ROLE_GPIO_LINE 17  /* GPIO17 for role detection */
+#define CS_GPIO_LINE 27     /* GPIO27 for CS (master mode) */
+
+typedef enum {
+    ROLE_MASTER,
+    ROLE_SLAVE,
+    ROLE_AUTO
+} SPIRole_t;
+
+typedef struct {
+    int spi_fd;
+    SPIRole_t role;
+    uint32_t speed;
+    uint8_t mode;
+    uint8_t bits;
+    struct gpiod_chip *gpio_chip;
+    struct gpiod_line *role_line;
+    struct gpiod_line *cs_line;
+    int running;
+} SPIContext_t;
+
+/* Function prototypes */
+SPIRole_t detect_role(SPIContext_t *ctx);
+int spi_init(SPIContext_t *ctx);
+int spi_master_write(SPIContext_t *ctx, uint8_t *data, int length);
+int spi_master_read(SPIContext_t *ctx, uint8_t *data, int length);
+void *spi_slave_thread(void *arg);
+void cleanup(SPIContext_t *ctx);
+
+/* Detect role using GPIO */
+SPIRole_t detect_role(SPIContext_t *ctx)
+{
+    int value;
+    
+    /* Read role detection pin */
+    value = gpiod_line_get_value(ctx->role_line);
+    
+    if (value == 0) {
+        printf("Role detection: MASTER (pin grounded)\n");
+        return ROLE_MASTER;
+    } else {
+        printf("Role detection: SLAVE (pin floating)\n");
+        return ROLE_SLAVE;
+    }
+}
+
+/* Initialize GPIO for role detection and CS */
+int init_gpio(SPIContext_t *ctx)
+{
+    /* Open GPIO chip */
+    ctx->gpio_chip = gpiod_chip_open_by_name(ROLE_GPIO_CHIP);
+    if (!ctx->gpio_chip) {
+        perror("Failed to open GPIO chip");
+        return -1;
+    }
+    
+    /* Get role detection line */
+    ctx->role_line = gpiod_chip_get_line(ctx->gpio_chip, ROLE_GPIO_LINE);
+    if (!ctx->role_line) {
+        perror("Failed to get role GPIO line");
+        gpiod_chip_close(ctx->gpio_chip);
+        return -1;
+    }
+    
+    /* Request role line as input with pull-up */
+    if (gpiod_line_request_input(ctx->role_line, "spi-role") < 0) {
+        perror("Failed to request role GPIO");
+        gpiod_chip_close(ctx->gpio_chip);
+        return -1;
+    }
+    
+    return 0;
+}
+
+/* Initialize SPI based on role */
+int spi_init(SPIContext_t *ctx)
+{
+    int ret;
+    
+    /* Detect role if AUTO */
+    if (ctx->role == ROLE_AUTO) {
+        ctx->role = detect_role(ctx);
+    }
+    
+    /* Open SPI device */
+    ctx->spi_fd = open(SPI_DEVICE, O_RDWR);
+    if (ctx->spi_fd < 0) {
+        perror("Can't open SPI device");
+        return -1;
+    }
+    
+    if (ctx->role == ROLE_MASTER) {
+        /* Master mode configuration */
+        ctx->mode = SPI_MODE_0;
+        ctx->bits = 8;
+        ctx->speed = 1000000;
+        
+        /* Set mode */
+        ret = ioctl(ctx->spi_fd, SPI_IOC_WR_MODE, &ctx->mode);
+        if (ret < 0) {
+            perror("Can't set SPI mode");
+            close(ctx->spi_fd);
+            return -1;
+        }
+        
+        /* Set bits per word */
+        ret = ioctl(ctx->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &ctx->bits);
+        if (ret < 0) {
+            perror("Can't set bits per word");
+            close(ctx->spi_fd);
+            return -1;
+        }
+        
+        /* Set speed */
+        ret = ioctl(ctx->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &ctx->speed);
+        if (ret < 0) {
+            perror("Can't set speed");
+            close(ctx->spi_fd);
+            return -1;
+        }
+        
+        /* Configure CS line */
+        ctx->cs_line = gpiod_chip_get_line(ctx->gpio_chip, CS_GPIO_LINE);
+        if (ctx->cs_line) {
+            gpiod_line_request_output(ctx->cs_line, "spi-cs", 1);
+        }
+        
+        printf("SPI initialized as MASTER at %d Hz\n", ctx->speed);
+    } 
+    else {
+        /* Slave mode - note: standard spidev may not support slave mode well */
+        printf("SPI initialized as SLAVE (limited support in spidev)\n");
+        printf("Consider using GPIO bitbang for full slave support\n");
+    }
+    
+    return 0;
+}
+
+/* Master write function */
+int spi_master_write(SPIContext_t *ctx, uint8_t *data, int length)
+{
+    struct spi_ioc_transfer tr = {
+        .tx_buf = (unsigned long)data,
+        .rx_buf = 0,
+        .len = length,
+        .speed_hz = ctx->speed,
+        .bits_per_word = ctx->bits,
+    };
+    
+    /* Assert CS */
+    if (ctx->cs_line) {
+        gpiod_line_set_value(ctx->cs_line, 0);
+    }
+    
+    /* Perform transfer */
+    int ret = ioctl(ctx->spi_fd, SPI_IOC_MESSAGE(1), &tr);
+    
+    /* Deassert CS */
+    if (ctx->cs_line) {
+        gpiod_line_set_value(ctx->cs_line, 1);
+    }
+    
+    return ret;
+}
+
+/* Master read function */
+int spi_master_read(SPIContext_t *ctx, uint8_t *data, int length)
+{
+    uint8_t dummy[length];
+    memset(dummy, 0, length);
+    
+    struct spi_ioc_transfer tr = {
+        .tx_buf = (unsigned long)dummy,
+        .rx_buf = (unsigned long)data,
+        .len = length,
+        .speed_hz = ctx->speed,
+        .bits_per_word = ctx->bits,
+    };
+    
+    /* Assert CS */
+    if (ctx->cs_line) {
+        gpiod_line_set_value(ctx->cs_line, 0);
+    }
+    
+    /* Perform transfer */
+    int ret = ioctl(ctx->spi_fd, SPI_IOC_MESSAGE(1), &tr);
+    
+    /* Deassert CS */
+    if (ctx->cs_line) {
+        gpiod_line_set_value(ctx->cs_line, 1);
+    }
+    
+    return ret;
+}
+
+/* Slave thread function */
+void *spi_slave_thread(void *arg)
+{
+    SPIContext_t *ctx = (SPIContext_t *)arg;
+    uint8_t buffer[256];
+    
+    printf("Slave thread started - waiting for master\n");
+    
+    while (ctx->running) {
+        /* In real slave mode, you'd wait for interrupt or use GPIO */
+        /* This is simplified - would need proper slave implementation */
+        
+        usleep(100000);  /* 100ms polling */
+    }
+    
+    return NULL;
+}
+
+/* Cleanup function */
+void cleanup(SPIContext_t *ctx)
+{
+    ctx->running = 0;
+    
+    if (ctx->spi_fd >= 0) {
+        close(ctx->spi_fd);
+    }
+    
+    if (ctx->cs_line) {
+        gpiod_line_release(ctx->cs_line);
+    }
+    
+    if (ctx->role_line) {
+        gpiod_line_release(ctx->role_line);
+    }
+    
+    if (ctx->gpio_chip) {
+        gpiod_chip_close(ctx->gpio_chip);
+    }
+    
+    printf("SPI context cleaned up\n");
+}
+
+/* Signal handler */
+SPIContext_t *global_ctx = NULL;
+
+void signal_handler(int sig)
+{
+    printf("\nReceived signal %d, cleaning up...\n", sig);
+    if (global_ctx) {
+        cleanup(global_ctx);
+    }
+    exit(0);
+}
+
+int main(int argc, char **argv)
+{
+    SPIContext_t ctx = {
+        .spi_fd = -1,
+        .role = ROLE_AUTO,
+        .speed = 1000000,
+        .mode = 0,
+        .bits = 8,
+        .gpio_chip = NULL,
+        .role_line = NULL,
+        .cs_line = NULL,
+        .running = 1
+    };
+    
+    global_ctx = &ctx;
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    /* Parse command line arguments */
+    if (argc > 1) {
+        if (strcmp(argv[1], "master") == 0) {
+            ctx.role = ROLE_MASTER;
+        } else if (strcmp(argv[1], "slave") == 0) {
+            ctx.role = ROLE_SLAVE;
+        } else {
+            ctx.role = ROLE_AUTO;
+        }
+    }
+    
+    /* Initialize GPIO */
+    if (init_gpio(&ctx) < 0) {
+        return -1;
+    }
+    
+    /* Initialize SPI */
+    if (spi_init(&ctx) < 0) {
+        cleanup(&ctx);
+        return -1;
+    }
+    
+    /* Run based on role */
+    if (ctx.role == ROLE_MASTER) {
+        printf("Running as MASTER\n");
+        
+        while (ctx.running) {
+            uint8_t cmd[] = "READ_SENSOR";
+            uint8_t response[64] = {0};
+            
+            printf("Master sending command...\n");
+            spi_master_write(&ctx, cmd, sizeof(cmd));
+            
+            sleep(1);
+            
+            printf("Master reading response...\n");
+            spi_master_read(&ctx, response, 32);
+            printf("Response: %s\n", response);
+            
+            sleep(2);
+        }
+    } else {
+        printf("Running as SLAVE\n");
+        
+        pthread_t slave_thread;
+        pthread_create(&slave_thread, NULL, spi_slave_thread, &ctx);
+        
+        /* Main loop for slave */
+        while (ctx.running) {
+            /* Do other slave tasks */
+            usleep(100000);
+        }
+        
+        pthread_join(slave_thread, NULL);
+    }
+    
+    cleanup(&ctx);
+    return 0;
+}
+
