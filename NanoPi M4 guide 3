@@ -1,0 +1,165 @@
+To configure the NanoPi M4 (RK3399-based) as an SPI slave for communication with the STM32F103Z as master, you need to make kernel and device tree changes, as Linux SPI slave mode requires specific setup. The standard spidev interface can then be used in userspace for slave operations.
+
+Step 1: Kernel Configuration
+Recompile the kernel (from FriendlyElec or Rockchip sources) with SPI slave support:
+
+Enable CONFIG_SPI_SLAVE=y in .config (Device Drivers > SPI support > SPI slave protocol handlers).
+Enable the Rockchip SPI slave driver: CONFIG_SPI_ROCKCHIP_SLAVE=y (or similar; check drivers/spi/spi-rockchip-slave.c in your kernel tree).
+Build and flash the new kernel to your NanoPi M4.
+
+Step 2: Device Tree Modification
+Modify the device tree source (DTS) for your OS (e.g., rk3399-nanopi-m4.dts or similar). Add or update the SPI node (assuming SPI1 on the 40-pin header: pins 19=MOSI, 21=MISO, 23=CLK, 24=CS).
+&spi1 {
+    compatible = "rockchip,spi-slave";
+    status = "okay";
+    spi-slave;
+    // Optional ready GPIO if you need signaling (e.g., GPIO1_D2 active low)
+    ready-gpios = <&gpio1 26 GPIO_ACTIVE_LOW>; // Adjust pin as needed
+    slave {
+        compatible = "spidev";
+        reg = <0>;
+        spi-max-frequency = <10000000>; // Adjust to match STM32 master clock
+        spi-cpha; // Optional: Set if your protocol uses CPHA=1
+        spi-cpol; // Optional: Set if your protocol uses CPOL=1
+        status = "okay";
+    };
+};
+
+Compile the DTB: dtc -@ -I dts -O dtb -o rk3399-nanopi-m4.dtb rk3399-nanopi-m4.dts.
+Replace the existing DTB on your boot partition and reboot.
+
+After boot, check for /dev/spidev1.0 (SPI bus 1, CS 0). If present, enable the spidev handler:
+echo spidev > /sys/class/spi_slave/spi1/slave
+
+Step 3: Slave Code on NanoPi M4 (Userspace C Program)
+This simple C program uses the spidev interface to act as an SPI slave. It queues a full-duplex transfer (sends response data when the master clocks in data) and prints received data. Compile with gcc spi_slave.c -o spi_slave and run as ./spi_slave.
+#include <stdint.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/types.h>
+#include <linux/spi/spidev.h>
+
+#define SPI_DEVICE "/dev/spidev1.0"  // Adjust if your bus is different
+#define ARRAY_SIZE 8  // Example transfer size; adjust as needed
+
+int main(int argc, char *argv[]) {
+    int fd;
+    uint8_t tx[] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x00};  // Data to send back to master
+    uint8_t rx[ARRAY_SIZE] = {0, };
+    struct spi_ioc_transfer tr = {
+        .tx_buf = (unsigned long)tx,
+        .rx_buf = (unsigned long)rx,
+        .len = ARRAY_SIZE,
+        .speed_hz = 1000000,  // 1 MHz; match master
+        .bits_per_word = 8,
+    };
+
+    fd = open(SPI_DEVICE, O_RDWR);
+    if (fd < 0) {
+        perror("Can't open device");
+        return 1;
+    }
+
+    // Set SPI mode (e.g., CPOL=0, CPHA=0; adjust if needed)
+    uint8_t mode = SPI_MODE_0;
+    if (ioctl(fd, SPI_IOC_WR_MODE, &mode) == -1) {
+        perror("Can't set SPI mode");
+        close(fd);
+        return 1;
+    }
+
+    printf("Waiting for master transfer...\n");
+
+    // Queue the transfer (blocks until master initiates)
+    if (ioctl(fd, SPI_IOC_MESSAGE(1), &tr) == -1) {
+        perror("Can't send SPI message");
+        close(fd);
+        return 1;
+    }
+
+    // Print received data from master
+    printf("Received from master: ");
+    for (int i = 0; i < ARRAY_SIZE; i++) {
+        printf("%02X ", rx[i]);
+    }
+    printf("\n");
+
+    close(fd);
+    return 0;
+}
+
+Run this on the NanoPi M4. It will block until the STM32 master sends data.
+For testing, you can use the kernel's spidev_test tool: spidev_test -D /dev/spidev1.0 -p "slave-response-data" & (replace with your data).
+
+Step 4: Master Code on STM32F103Z (C using HAL)
+For completeness, here's example STM32 master code (using STM32CubeMX or HAL). It sends data to the slave and receives the response. Configure SPI1 as master (e.g., pins PA5=SCK, PA6=MISO, PA7=MOSI, PA4=CS).
+#include "stm32f1xx_hal.h"
+
+SPI_HandleTypeDef hspi1;
+
+void SystemClock_Config(void);  // Your clock config
+static void MX_GPIO_Init(void);
+static void MX_SPI1_Init(void);
+
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_SPI1_Init();
+
+    uint8_t tx_data[8] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};  // Data to send
+    uint8_t rx_data[8];
+
+    // Pull CS low to select slave
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+
+    // Full-duplex transfer
+    HAL_SPI_TransmitReceive(&hspi1, tx_data, rx_data, 8, HAL_MAX_DELAY);
+
+    // Pull CS high to deselect
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
+    // Process rx_data (received from NanoPi slave)
+    while (1) {
+        // Your loop
+    }
+}
+
+static void MX_SPI1_Init(void) {
+    hspi1.Instance = SPI1;
+    hspi1.Init.Mode = SPI_MODE_MASTER;
+    hspi1.Init.Direction = SPI_DIRECTION_2LINES;
+    hspi1.Init.DataSize = SPI_DATASIZE_8BIT;
+    hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;  // CPOL=0
+    hspi1.Init.CLKPhase = SPI_PHASE_1EDGE;     // CPHA=0
+    hspi1.Init.NSS = SPI_NSS_SOFT;
+    hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_16;  // Adjust for ~1 MHz
+    hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
+    hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
+    hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
+    hspi1.Init.CRCPolynomial = 10;
+    HAL_SPI_Init(&hspi1);
+}
+
+static void MX_GPIO_Init(void) {
+    // Enable clocks, configure PA4 as output for CS, etc.
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_4;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);  // CS high initially
+}
+
+Wire the pins: STM32 MOSI to NanoPi MISO (pin 21), MISO to MOSI (pin 19), SCK to SCK (pin 23), CS to CS (pin 24).
+Match clock speed, mode (CPOL/CPHA), and data size on both sides.
+If issues, check dmesg for SPI errors and ensure levels are 3.3V compatible.
+
+This sets up basic communication. For production, add error handling and protocol specifics. If your OS/kernel doesn't have slave support, you may need to backport patches from Rockchip repos.
+
+
