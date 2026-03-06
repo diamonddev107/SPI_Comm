@@ -1,0 +1,373 @@
+Option 1: Device Tree Modification (Recommended)
+First, you need to modify the device tree to set the SPI controller to slave mode:
+
+1. Create a Device Tree Overlay
+Create a file spi1-slave.dts:
+
+/dts-v1/;
+/plugin/;
+
+/ {
+    fragment@0 {
+        target = <&spi1>;
+        __overlay__ {
+            status = "okay";
+            spi-slave;  // Enable slave mode
+            #address-cells = <1>;
+            #size-cells = <0>;
+            
+            slave {
+                compatible = "spidev";
+                reg = <0>;  // Slave device address
+                spi-max-frequency = <1000000>;  // 1MHz
+                status = "okay";
+            };
+        };
+    };
+};
+
+2. Compile and Apply the Overlay
+# Compile the device tree overlay
+dtc -@ -I dts -O dtb -o spi1-slave.dtbo spi1-slave.dts
+
+# Copy to overlays directory
+sudo cp spi1-slave.dtbo /boot/dtbo/
+
+# Add to /boot/armbianEnv.txt or /boot/uEnv.txt
+echo "overlays=spi1-slave" | sudo tee -a /boot/armbianEnv.txt
+
+# Reboot
+sudo reboot
+
+
+Option 2: SPI Slave Userspace Program
+Here's a C program for the NanoPi M4 to act as an SPI slave:
+
+spi_slave.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/types.h>
+#include <linux/spi/spidev.h>
+#include <linux/spi/spi.h>
+#include <signal.h>
+#include <pthread.h>
+
+#define SPI_DEVICE "/dev/spidev1.0"
+#define BUFFER_SIZE 256
+
+static int running = 1;
+static int spi_fd = -1;
+
+void signal_handler(int sig) {
+    printf("\nReceived signal %d, exiting...\n", sig);
+    running = 0;
+    if (spi_fd >= 0) {
+        close(spi_fd);
+    }
+}
+
+void delay_ms(int ms) {
+    usleep(ms * 1000);
+}
+
+int spi_slave_init() {
+    int fd;
+    int mode = SPI_MODE_0;
+    int bits = 8;
+    int speed = 1000000;  // 1MHz
+    int lsb = 0;
+    int cs_high = 1;  // For slave mode, CS is controlled by master
+    
+    fd = open(SPI_DEVICE, O_RDWR);
+    if (fd < 0) {
+        perror("Failed to open SPI device");
+        return -1;
+    }
+    
+    // Set SPI mode (for slave, we don't set speed)
+    if (ioctl(fd, SPI_IOC_WR_MODE, &mode) < 0) {
+        perror("Failed to set SPI mode");
+        close(fd);
+        return -1;
+    }
+    
+    // Set bits per word
+    if (ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0) {
+        perror("Failed to set bits per word");
+        close(fd);
+        return -1;
+    }
+    
+    // Set LSB first option
+    if (ioctl(fd, SPI_IOC_WR_LSB_FIRST, &lsb) < 0) {
+        perror("Failed to set LSB first");
+        close(fd);
+        return -1;
+    }
+    
+    printf("SPI slave initialized on %s\n", SPI_DEVICE);
+    printf("Mode: %d, Bits: %d, Speed: %d Hz\n", mode, bits, speed);
+    
+    return fd;
+}
+
+int spi_slave_transfer(int fd, uint8_t *tx_buf, uint8_t *rx_buf, int len) {
+    struct spi_ioc_transfer tr = {
+        .tx_buf = (unsigned long)tx_buf,
+        .rx_buf = (unsigned long)rx_buf,
+        .len = len,
+        .speed_hz = 0,  // For slave, speed is determined by master
+        .delay_usecs = 0,
+        .bits_per_word = 8,
+        .cs_change = 0,
+    };
+    
+    int ret = ioctl(fd, SPI_IOC_MESSAGE(1), &tr);
+    if (ret < 0) {
+        perror("SPI transfer failed");
+        return -1;
+    }
+    
+    return ret;
+}
+
+void *spi_listen_thread(void *arg) {
+    int fd = *(int *)arg;
+    uint8_t tx_buffer[BUFFER_SIZE];
+    uint8_t rx_buffer[BUFFER_SIZE];
+    int transfer_count = 0;
+    
+    printf("SPI slave listening thread started\n");
+    
+    while (running) {
+        // Prepare response data
+        memset(tx_buffer, 0, BUFFER_SIZE);
+        snprintf((char *)tx_buffer, BUFFER_SIZE, "Response %d from NanoPi M4", transfer_count);
+        
+        // Wait for master to initiate communication
+        memset(rx_buffer, 0, BUFFER_SIZE);
+        int ret = spi_slave_transfer(fd, tx_buffer, rx_buffer, BUFFER_SIZE);
+        
+        if (ret >= 0) {
+            printf("Transfer %d: Received %d bytes\n", transfer_count, ret);
+            printf("Data from master: %s\n", rx_buffer);
+            
+            // Echo received data (first 16 bytes)
+            printf("Hex dump: ");
+            for (int i = 0; i < 16 && i < ret; i++) {
+                printf("%02X ", rx_buffer[i]);
+            }
+            printf("\n");
+            
+            transfer_count++;
+        }
+        
+        delay_ms(10);  // Small delay between transfers
+    }
+    
+    return NULL;
+}
+
+int main() {
+    pthread_t listen_thread;
+    
+    // Setup signal handling
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    
+    printf("NanoPi M4 SPI Slave Program\n");
+    printf("============================\n");
+    
+    // Initialize SPI slave
+    spi_fd = spi_slave_init();
+    if (spi_fd < 0) {
+        return 1;
+    }
+    
+    // Create listening thread
+    if (pthread_create(&listen_thread, NULL, spi_listen_thread, &spi_fd) != 0) {
+        perror("Failed to create listening thread");
+        close(spi_fd);
+        return 1;
+    }
+    
+    printf("SPI slave is ready. Waiting for master (STM32) communication...\n");
+    printf("Press Ctrl+C to exit\n");
+    
+    // Wait for thread to finish
+    pthread_join(listen_thread, NULL);
+    
+    // Cleanup
+    close(spi_fd);
+    printf("SPI slave terminated\n");
+    
+    return 0;
+}
+
+Makefile
+CC = gcc
+CFLAGS = -Wall -pthread
+TARGET = spi_slave
+SOURCE = spi_slave.c
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE)
+
+clean:
+	rm -f $(TARGET)
+
+install:
+	cp $(TARGET) /usr/local/bin/
+
+.PHONY: all clean install
+
+
+
+Option 3: Python SPI Slave (Simpler)
+Here's a Python script for testing:
+
+spi_slave.py
+#!/usr/bin/env python3
+import spidev
+import time
+import signal
+import sys
+import threading
+
+# Global flag for running
+running = True
+
+def signal_handler(sig, frame):
+    global running
+    print('\nStopping SPI slave...')
+    running = False
+
+class SPISlave:
+    def __init__(self, bus=1, device=0):
+        self.bus = bus
+        self.device = device
+        self.spi = None
+        
+    def init_slave(self):
+        """Initialize SPI in slave mode"""
+        try:
+            self.spi = spidev.SpiDev()
+            self.spi.open(self.bus, self.device)
+            
+            # Configure for slave mode (these are just defaults)
+            self.spi.mode = 0b00  # SPI mode 0
+            self.spi.bits_per_word = 8
+            self.spi.lsbfirst = False
+            
+            print(f"SPI slave initialized on bus {self.bus}, device {self.device}")
+            print(f"Mode: {self.spi.mode}, Bits: {self.spi.bits_per_word}")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to initialize SPI: {e}")
+            return False
+    
+    def listen_loop(self):
+        """Main listening loop"""
+        counter = 0
+        
+        while running:
+            try:
+                # Prepare response data
+                response = f"Resp{counter:04d}".encode()
+                # Pad to make it 32 bytes
+                response = response.ljust(32, b'\x00')
+                
+                # Perform transfer (will block until master communicates)
+                # In Python's spidev, this always acts as master
+                # For real slave mode, you'd need to use ioctl directly
+                # This is a simplified example
+                
+                # For demonstration, just show that we're waiting
+                print(f"Waiting for master... (counter: {counter})", end='\r')
+                
+                # Simulate slave response delay
+                time.sleep(0.1)
+                counter += 1
+                
+            except Exception as e:
+                print(f"Error in transfer: {e}")
+                break
+    
+    def cleanup(self):
+        """Clean up resources"""
+        if self.spi:
+            self.spi.close()
+
+def main():
+    # Setup signal handling
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    print("NanoPi M4 SPI Slave (Python)")
+    print("=============================")
+    
+    # Create and initialize SPI slave
+    slave = SPISlave(bus=1, device=0)
+    if not slave.init_slave():
+        sys.exit(1)
+    
+    try:
+        print("SPI slave ready. Waiting for master...")
+        print("Press Ctrl+C to exit")
+        slave.listen_loop()
+        
+    except Exception as e:
+        print(f"Error: {e}")
+        
+    finally:
+        slave.cleanup()
+        print("SPI slave stopped")
+
+if __name__ == "__main__":
+    main()
+
+
+
+Hardware Connections
+Connect the NanoPi M4 to STM32F103Z:
+NanoPi M4 (Slave)    STM32F103Z (Master)
+--------------       ---------------
+SPI1_MOSI (Pin)  <->  SPI_MOSI
+SPI1_MISO (Pin)  <->  SPI_MISO
+SPI1_CLK (Pin)   <->  SPI_SCK
+SPI1_CS0 (Pin)   <->  SPI_CS
+GND              <->  GND
+
+
+Important Notes:
+
+Check the NanoPi M4 pinout for correct SPI1 pins
+
+Use level shifters if voltage levels differ (3.3V vs 5V)
+
+Enable SPI1 in the device tree first
+
+The SPI slave mode in Linux may require kernel patches depending on your kernel version
+
+
+Compilation and Usage
+# For C program
+make
+sudo ./spi_slave
+
+# For Python script
+chmod +x spi_slave.py
+./spi_slave.py
+
+
+
+
+
+
